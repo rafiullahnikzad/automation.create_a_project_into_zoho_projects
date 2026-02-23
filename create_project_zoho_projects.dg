@@ -1,0 +1,545 @@
+/**
+ * ============================================================
+ * FUNCTION: automation.create_a_project_into_zoho_projects
+ * ============================================================
+ * DESCRIPTION:
+ *   Automatically creates a project in Zoho Projects when a
+ *   CRM Deal is updated (e.g., moved to "Closed Won"). This
+ *   function performs the following operations:
+ *
+ *   1. Fetches Deal details from Zoho CRM
+ *   2. Resolves the Deal Owner's Zoho Projects User ID (zpuid)
+ *   3. Creates a new project in Zoho Projects (v3 API)
+ *   4. Maps and updates all custom UDF fields (v1 API)
+ *   5. Resolves multi-user "Project Owners" field → Zoho Projects
+ *      ZUIDs → updates the Employee Name (emp) UDF via v3 PATCH
+ *   6. Associates the new project with the CRM Deal
+ *   7. Updates the CRM Deal with the Project URL and Project ID
+ *
+ * TRIGGER:
+ *   Zoho CRM Workflow / Button / Scheduled function on Deals module
+ *
+ * PARAMETERS:
+ *   @param dealId (Int) — The Zoho CRM Deal Record ID
+ *
+ * CONNECTIONS REQUIRED:
+ *   - zohocrm        : Zoho CRM OAuth connection
+ *   - zoho_projects  : Zoho Projects OAuth connection
+ *
+ * APIS USED:
+ *   - Zoho CRM REST API v2.1
+ *   - Zoho Projects REST API v1 (custom fields update)
+ *   - Zoho Projects REST API v3 (project create / user lookup / PATCH)
+ *
+ * AUTHOR : Rafiullah Nikzad — Senior Zoho Developer @ CloudZ Technologies
+ * GITHUB : https://github.com/rafiullahnikzad
+ * PORTFOLIO: https://rafiullahnikzad.netlify.app
+ * LINKEDIN: Zoho Afghanistan Community
+ * VERSION: 1.0.0
+ * ============================================================
+ */
+
+void automation.create_a_project_into_zoho_projects(Int dealId)
+{
+    // ============================================================
+    // CONFIGURATION
+    // Replace portalId with your own Zoho Projects Portal ID.
+    // Find it in Zoho Projects → Settings → Portal Settings.
+    // ============================================================
+    portalId = "905919238";
+
+    try
+    {
+        // ============================================================
+        // STEP 1: FETCH DEAL RECORD FROM ZOHO CRM
+        // Retrieves all field values for the given Deal ID using the
+        // built-in Zoho CRM Deluge task.
+        // ============================================================
+        deal = zoho.crm.getRecordById("Deals", dealId);
+
+        // ASEM_Project_Ref is used as the project name in Zoho Projects
+        ASEM_Project_Ref = deal.get("ASEM_Project_Ref");
+
+        // Deal Owner's email is used to look up their Zoho Projects user account
+        downer = deal.get("Owner").get("email");
+
+
+        // ============================================================
+        // STEP 2: RESOLVE DEAL OWNER → ZOHO PROJECTS USER ID (zpuid)
+        // Zoho Projects v3 API requires a zpuid (Zoho Projects User ID)
+        // to set the project owner. We look up the user by their email.
+        // ============================================================
+        User = invokeurl
+        [
+            url :"https://projectsapi.zoho.com/api/v3/portal/" + portalId + "/users/" + downer
+            type :GET
+            connection:"zoho_projects"
+        ];
+        info "Projects User Response: " + User;
+
+        zpuid = User.get("id");
+        info "Deal Owner zpuid: " + zpuid;
+
+        // Additional deal fields used later for custom field mapping
+        dealAmount         = deal.get("Amount");
+        closingDate        = deal.get("Closing_Date");
+        dealOwner          = deal.get("Owner");
+        accountName        = deal.get("Account_Name");
+        stage              = deal.get("Stage");
+        dealIdStr          = deal.get("id");
+
+        // Optional: guard against non-Closed Won deals (currently informational only)
+        if(stage != "Closed Won")
+        {
+            info "Note: Deal is not Closed Won. Current stage: " + stage;
+            // Uncomment the line below to enforce Closed Won restriction:
+            // return;
+        }
+
+
+        // ============================================================
+        // STEP 3: PREPARE AND CREATE THE PROJECT (Zoho Projects v3 API)
+        // The project name is taken from the ASEM_Project_Ref field.
+        // Owner is set using the zpuid resolved in Step 2.
+        // ============================================================
+        projectName = ASEM_Project_Ref;
+        info "Creating project with name: " + projectName;
+
+        projectData = Map();
+        projectData.put("name", projectName);
+        projectData.put("owner", {"zpuid": zpuid});
+
+        info "=== Project Creation Payload ===";
+        info projectData;
+
+        createProjectUrl = "https://projectsapi.zoho.com/api/v3/portal/" + portalId + "/projects";
+
+        projectResponse = invokeurl
+        [
+            url :createProjectUrl
+            type :POST
+            parameters:projectData.toString()
+            connection:"zoho_projects"
+        ];
+        info "Create Project Response: " + projectResponse;
+
+
+        // ============================================================
+        // STEP 4: VALIDATE PROJECT CREATION RESPONSE
+        // ============================================================
+        if(projectResponse.get("id") != null)
+        {
+            projectId       = projectResponse.get("id");
+            pname           = projectResponse.get("name");
+            projectIdString = projectResponse.get("id_string");
+
+            // Fallback: if id_string is not returned, convert id to string
+            if(projectIdString == null)
+            {
+                projectIdString = projectId.toString();
+            }
+
+            info "Project created successfully!";
+            info "Project ID        : " + projectId;
+            info "Project ID String : " + projectIdString;
+
+
+            // ============================================================
+            // STEP 5: MAP CRM DEAL FIELDS → ZOHO PROJECTS CUSTOM FIELDS (UDFs)
+            // Zoho Projects custom fields use internal UDF keys (e.g., UDF_TEXT2).
+            // These keys are found in Zoho Projects → Settings → Custom Fields.
+            //
+            // Field Mapping Reference:
+            //   UDF_TEXT2   → Client Name (Account ID — integration link field)
+            //   UDF_CHAR8   → Project Status (picklist)
+            //   UDF_CHAR3   → Client PO Number
+            //   UDF_CHAR4   → Remaining Amount (text)
+            //   UDF_DATE1   → Client PO Date
+            //   UDF_DATE2   → Delivery Date
+            //   UDF_DATE3   → Expected Shipment Date
+            //   UDF_DATE4   → Arrival at Warehouse Date
+            //   UDF_DATE5   → Arrival at Port Date
+            //   UDF_DATE6   → Arrival at Site Date
+            //   UDF_DOUBLE1 → Client Second Payment
+            //   UDF_DOUBLE2 → Client Fourth Payment
+            //   UDF_DOUBLE3 → Client Third Payment
+            //   UDF_DOUBLE6 → Vendor Order Value (AED)
+            //   UDF_DOUBLE7 → Vendor Order Value (EUR)
+            //   UDF_DOUBLE8 → Vendor Order Value (USD)
+            //   UDF_DOUBLE11→ Client First Payment
+            //   UDF_DOUBLE12→ Client Order Value incl. VAT
+            //   UDF_DOUBLE13→ Vendor Amount
+            //   UDF_DOUBLE14→ First Partial Payment
+            //   UDF_DOUBLE15→ Second Partial Payment
+            //   UDF_DOUBLE16→ Third Partial Payment
+            //   UDF_DOUBLE17→ Fourth Partial Payment
+            //   UDF_DOUBLE18→ Vendor Remaining Amount
+            // ============================================================
+            updateData = Map();
+
+            // --- CLIENT NAME (Integration/Lookup Field) ---
+            // Maps the linked Account (client) ID to UDF_TEXT2
+            if(accountName != null && accountName != "")
+            {
+                accountId = accountName.get("id");
+                updateData.put("UDF_TEXT2", accountId);
+                info "Client Name — Account ID  : " + accountId;
+                info "Client Name — Account Name: " + accountName.get("name");
+            }
+
+            // --- PICKLIST FIELDS ---
+            projectStatus = deal.get("Project_Status");
+            if(projectStatus != null && projectStatus != "")
+            {
+                updateData.put("UDF_CHAR8", projectStatus);
+            }
+
+            // --- TEXT / CHAR FIELDS ---
+            clientPoNo = deal.get("Client_Po_No");
+            if(clientPoNo != null && clientPoNo != "")
+            {
+                updateData.put("UDF_CHAR3", clientPoNo);
+            }
+
+            reminingAmount = deal.get("Remining_Amount");
+            if(reminingAmount != null && reminingAmount != "")
+            {
+                updateData.put("UDF_CHAR4", reminingAmount);
+            }
+
+            // --- DATE FIELDS ---
+            // Zoho Projects expects date format: MM-dd-yyyy
+            clientPoDate = deal.get("Client_PO_Date");
+            if(clientPoDate != null && clientPoDate != "")
+            {
+                updateData.put("UDF_DATE1", clientPoDate.toString("MM-dd-yyyy"));
+            }
+
+            deliveryDate = deal.get("Delivery_Date");
+            if(deliveryDate != null && deliveryDate != "")
+            {
+                updateData.put("UDF_DATE2", deliveryDate.toString("MM-dd-yyyy"));
+            }
+
+            expectedShipment = deal.get("Expected_Shipment");
+            if(expectedShipment != null && expectedShipment != "")
+            {
+                updateData.put("UDF_DATE3", expectedShipment.toString("MM-dd-yyyy"));
+            }
+
+            arrivalWarehouse = deal.get("Arrival_at_Warehouse");
+            if(arrivalWarehouse != null && arrivalWarehouse != "")
+            {
+                updateData.put("UDF_DATE4", arrivalWarehouse.toString("MM-dd-yyyy"));
+            }
+
+            arrivalPort = deal.get("Arrival_at_Port");
+            if(arrivalPort != null && arrivalPort != "")
+            {
+                updateData.put("UDF_DATE5", arrivalPort.toString("MM-dd-yyyy"));
+            }
+
+            arrivalSite = deal.get("Arrival_at_Site");
+            if(arrivalSite != null && arrivalSite != "")
+            {
+                updateData.put("UDF_DATE6", arrivalSite.toString("MM-dd-yyyy"));
+            }
+
+            // --- DECIMAL / DOUBLE FIELDS (Financial Values) ---
+            clientSecondPayment = deal.get("Clients_Second_Payment");
+            if(clientSecondPayment != null && clientSecondPayment != "")
+            {
+                updateData.put("UDF_DOUBLE1", clientSecondPayment);
+            }
+
+            clientForthPayment = deal.get("Client_Forth_Payment");
+            if(clientForthPayment != null && clientForthPayment != "")
+            {
+                updateData.put("UDF_DOUBLE2", clientForthPayment);
+            }
+
+            clientThirdPayment = deal.get("Clients_Third_Payment");
+            if(clientThirdPayment != null && clientThirdPayment != "")
+            {
+                updateData.put("UDF_DOUBLE3", clientThirdPayment);
+            }
+
+            vendorValueAED = deal.get("Vendor_Order_Value_AED");
+            if(vendorValueAED != null && vendorValueAED != "")
+            {
+                updateData.put("UDF_DOUBLE6", vendorValueAED);
+            }
+
+            vendorValueEuro = deal.get("Vendor_Order_Value_Euro");
+            if(vendorValueEuro != null && vendorValueEuro != "")
+            {
+                updateData.put("UDF_DOUBLE7", vendorValueEuro);
+            }
+
+            vendorValueUSD = deal.get("Vendor_Order_Value_USD");
+            if(vendorValueUSD != null && vendorValueUSD != "")
+            {
+                updateData.put("UDF_DOUBLE8", vendorValueUSD);
+            }
+
+            clientFirstPayment = deal.get("Clients_First_Payment");
+            if(clientFirstPayment != null && clientFirstPayment != "")
+            {
+                updateData.put("UDF_DOUBLE11", clientFirstPayment);
+            }
+
+            clientOrderValueVAT = deal.get("Client_order_value_incld_VAT");
+            if(clientOrderValueVAT != null && clientOrderValueVAT != "")
+            {
+                updateData.put("UDF_DOUBLE12", clientOrderValueVAT);
+            }
+
+            vendorAmount = deal.get("Vendor_Amount");
+            if(vendorAmount != null && vendorAmount != "")
+            {
+                updateData.put("UDF_DOUBLE13", vendorAmount);
+            }
+
+            firstPartialPayment = deal.get("First_Partial_Payment");
+            if(firstPartialPayment != null && firstPartialPayment != "")
+            {
+                updateData.put("UDF_DOUBLE14", firstPartialPayment);
+            }
+
+            secondPartialPayment = deal.get("Second_Partial_Payment");
+            if(secondPartialPayment != null && secondPartialPayment != "")
+            {
+                updateData.put("UDF_DOUBLE15", secondPartialPayment);
+            }
+
+            thirdPartialPayment = deal.get("Third_Partial_Payment");
+            if(thirdPartialPayment != null && thirdPartialPayment != "")
+            {
+                updateData.put("UDF_DOUBLE16", thirdPartialPayment);
+            }
+
+            forthPartialPayment = deal.get("Forth_Partial_Payment");
+            if(forthPartialPayment != null && forthPartialPayment != "")
+            {
+                updateData.put("UDF_DOUBLE17", forthPartialPayment);
+            }
+
+            vendorReminingAmount = deal.get("Vendor_Remining_Amount");
+            if(vendorReminingAmount != null && vendorReminingAmount != "")
+            {
+                updateData.put("UDF_DOUBLE18", vendorReminingAmount);
+            }
+
+
+            // ============================================================
+            // STEP 6: RESOLVE MULTI-USER "PROJECT OWNERS" FIELD
+            // ============================================================
+            // The "Project_Owners" field in CRM is a multi-lookup user field.
+            // We need to:
+            //   a) Re-fetch the deal via CRM REST API (v2.1) to get the raw
+            //      multi-user array — the built-in zoho.crm.getRecordById()
+            //      may not return multi-user lookup fields in the expected format.
+            //   b) For each owner, fetch their email from the CRM Users API.
+            //   c) Use that email to look up their Zoho Projects account → get ZUID.
+            //   d) Build a list of {Zuid: <value>} maps for the PATCH payload.
+            //
+            // UDF: emp  (api_name) / UDF_MULTIUSER1 (internal key)
+            //   → "Employee Name" multi-user custom field in Zoho Projects
+            // ============================================================
+            dealResponse = invokeurl
+            [
+                url :"https://www.zohoapis.com/crm/v2.1/Deals/" + dealId
+                type :GET
+                connection:"zohocrm"
+            ];
+            dealData       = dealResponse.get("data").get(0);
+            projectOwners  = dealData.get("Project_Owners");
+            info "Project Owners raw value: " + projectOwners;
+
+            // List to accumulate {Zuid: <value>} maps for each resolved owner
+            multiUserList = List();
+
+            if(projectOwners != null && projectOwners.size() > 0)
+            {
+                info "Resolving " + projectOwners.size() + " project owner(s) to Zoho Projects ZUIDs...";
+
+                for each owner in projectOwners
+                {
+                    // Each item in the multi-user array is a map where the key
+                    // matches the field api_name ("Project_Owners")
+                    ownerDetails = owner.get("Project_Owners");
+
+                    if(ownerDetails != null)
+                    {
+                        ownerId   = ownerDetails.get("id");
+                        ownerName = ownerDetails.get("name");
+                        info "Processing: " + ownerName + " (CRM User ID: " + ownerId + ")";
+
+                        try
+                        {
+                            // Fetch CRM user record to get their email address
+                            crmUserResponse = invokeurl
+                            [
+                                url :"https://www.zohoapis.com/crm/v2.1/users/" + ownerId
+                                type :GET
+                                connection:"zohocrm"
+                            ];
+                            ownerEmail = crmUserResponse.get("users").get(0).get("email");
+                            info "Resolved email: " + ownerEmail;
+
+                            if(ownerEmail != null && ownerEmail != "")
+                            {
+                                // Look up this email in Zoho Projects to get their ZUID
+                                // ZUID is a cross-product Zoho user identifier
+                                ownerProjectsUser = invokeurl
+                                [
+                                    url :"https://projectsapi.zoho.com/api/v3/portal/" + portalId + "/users/" + ownerEmail
+                                    type :GET
+                                    connection:"zoho_projects"
+                                ];
+                                ownerZuid = ownerProjectsUser.get("zuid");
+                                info "Resolved ZUID: " + ownerZuid + " for " + ownerName;
+
+                                if(ownerZuid != null)
+                                {
+                                    // Build the user entry for the multiuser field payload
+                                    // Must use toLong() because ZUID is a large numeric value
+                                    userMap = Map();
+                                    userMap.put("zuid", ownerZuid.toLong());
+                                    multiUserList.add(userMap);
+                                }
+                            }
+                        }
+                        catch (userErr)
+                        {
+                            // Non-fatal: log and continue if one owner can't be resolved
+                            info "Warning: Could not resolve Projects user for '" + ownerName + "': " + userErr;
+                        }
+                    }
+                }
+            }
+            info "Resolved multiUserList (ZUIDs): " + multiUserList;
+
+
+            // ============================================================
+            // STEP 7: UPDATE CUSTOM FIELDS (v1 API — POST)
+            // Zoho Projects v1 API is required for updating UDF custom fields
+            // (text, date, decimal). The v3 API does not support these yet.
+            // ============================================================
+            updateProjectUrl = "https://projectsapi.zoho.com/restapi/portal/" + portalId + "/projects/" + projectIdString + "/";
+            updateResponse = invokeurl
+            [
+                url :updateProjectUrl
+                type :POST
+                parameters:updateData
+                connection:"zoho_projects"
+            ];
+            info "Custom Fields Update Response (v1): " + updateResponse;
+
+
+            // ============================================================
+            // STEP 8: UPDATE MULTI-USER FIELD — "emp" (v3 API — PATCH)
+            // The Employee Name (emp / UDF_MULTIUSER1) field requires the
+            // Zoho Projects v3 API with a PATCH request.
+            // Payload format: { "emp": [ {"Zuid": 123456789}, ... ] }
+            // ============================================================
+            if(multiUserList.size() > 0)
+            {
+                empParams = Map();
+                empParams.put("emp", multiUserList);
+                info "Employee Name PATCH payload: " + empParams;
+
+                empResponse = invokeurl
+                [
+                    url :"https://projectsapi.zoho.com/api/v3/portal/" + portalId + "/projects/" + projectIdString
+                    type :PATCH
+                    parameters:empParams.toString()
+                    connection:"zoho_projects"
+                ];
+                info "Employee Name (emp) Update Response (v3 PATCH): " + empResponse;
+            }
+
+
+            // ============================================================
+            // STEP 9: CONSTRUCT THE PROJECT WEB URL
+            // This URL is stored back on the CRM Deal for easy navigation.
+            // Format: https://projects.zoho.com/portal/<portalId>#projectdashboard/<projectIdString>
+            // ============================================================
+            projectWebUrl = "https://projects.zoho.com/portal/" + portalId + "#projectdashboard/" + projectIdString;
+            info "Project Web URL: " + projectWebUrl;
+
+
+            // ============================================================
+            // STEP 10: ASSOCIATE PROJECT WITH CRM DEAL
+            // Zoho CRM supports native associations between CRM records
+            // and Zoho Projects via a built-in relationship endpoint.
+            // ============================================================
+            mp1 = Map();
+            mp1.put("name", pname);
+            mp1.put("owner", {"zpuid": zpuid});
+
+            datalist = List();
+            datalist.add(mp1);
+
+            datamp = Map();
+            datamp.put("data", datalist);
+
+            info "CRM-Project Association Payload: " + datamp;
+
+            response1 = invokeurl
+            [
+                url :"https://www.zohoapis.com/crm/v2/Deals/" + dealId + "/Zoho_Projects/" + projectId
+                type :POST
+                parameters:datamp.toString()
+                connection:"zoho_projects"
+            ];
+            info "CRM Association Response: " + response1;
+
+
+            // ============================================================
+            // STEP 11: UPDATE CRM DEAL WITH PROJECT DETAILS
+            // Writes the project URL and project ID back to the CRM Deal
+            // so team members can navigate directly to the project.
+            // ============================================================
+            updateMap = Map();
+            updateMap.put("Zoho_Projects_Link", projectWebUrl);   // URL field on Deal
+            updateMap.put("Zoho_Project_ID", projectIdString);    // Text field on Deal
+
+            updateDealResponse = zoho.crm.updateRecord("Deals", dealId, updateMap);
+            info "Deal Update Response: " + updateDealResponse;
+
+            if(updateDealResponse.get("id") != null)
+            {
+                info "✔ SUCCESS — Project created and linked to CRM Deal";
+                info "✔ Project URL   : " + projectWebUrl;
+                info "✔ Project Owner : " + downer;
+                info "✔ Custom fields : All populated";
+            }
+            else
+            {
+                info "✘ Error updating Deal with project link: " + updateDealResponse;
+            }
+        }
+
+        // ============================================================
+        // PROJECT CREATION ERROR HANDLING
+        // ============================================================
+        else if(projectResponse.get("error") != null)
+        {
+            info "✘ API Error creating project: " + projectResponse.get("error");
+        }
+        else
+        {
+            info "✘ Unexpected failure creating project. Full response: " + projectResponse;
+        }
+    }
+
+    // ============================================================
+    // GLOBAL EXCEPTION HANDLER
+    // Catches any unexpected runtime errors and logs them.
+    // ============================================================
+    catch (e)
+    {
+        info "✘ Unhandled exception in create_a_project_into_zoho_projects: " + e;
+    }
+}
